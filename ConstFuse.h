@@ -6,8 +6,6 @@
 #include <optional>
 #include <any>
 
-#include <iostream>
-
 namespace constfuse {
 	
 	namespace traits {
@@ -180,7 +178,7 @@ namespace constfuse {
 		inline auto any_parser_applicator(Parsers const& ...p) {
 
 			return [&](Iterator& it, Iterator end, Iterator backtrack, PResults& result, FResult& fres) -> bool {
-				return std::apply([&](auto& ...result_item) -> bool {
+				auto aplicator = [&](auto& ...result_item) -> bool {
 					bool parse_successful = false;
 
 					bool any_parse = (
@@ -192,7 +190,8 @@ namespace constfuse {
 					if (!any_parse) it = backtrack;
 					return any_parse;
 
-					}, result);
+				};
+				return std::apply(aplicator, result);
 			};
 		};
 
@@ -417,11 +416,35 @@ namespace constfuse {
 
 		template<typename Iterator>
 		bool operator()(Iterator& it, Iterator end, return_type* result) const {
-			static_assert(std::is_same_v<bool, std::invoke_result_t < F, Parser, Iterator >> != true, "Precondition must be a predicate (returning bool).");
-			if (functor(p, it)) {
+
+			if (functor(result)) {
 				return p(it, end, result);
 			}
 			return false;
+		}
+	};
+
+	template<typename F,typename Parser>
+	struct Postcond {
+		
+		using is_parser_type = std::true_type;
+		using return_type = typename Parser::return_type;
+
+		
+
+		F const functor;
+		Parser const p;
+
+		constexpr Postcond(F const& f, Parser const& par) :p(par), functor(f) {};
+
+		template<typename Iterator>
+		bool operator()(Iterator& it, Iterator end, return_type* result) const {
+			Iterator backtrack = it;
+
+			bool res = p(it, end, result);
+			bool fres = functor(res, result);
+			if (!fres) { it = backtrack; } // Is this usefull
+			return fres;
 		}
 	};
 
@@ -456,7 +479,29 @@ namespace constfuse {
 	};
 
 
-	
+	template<typename Parser>
+	struct Not {
+		using is_parser_type = std::true_type;
+		using return_type = typename Parser::return_type;
+
+
+		Parser const p;
+		constexpr Not(Parser const& p_) :p(p_) {};
+
+		template<typename Iterator>
+		bool operator()(Iterator& it, Iterator end, return_type* result) const {
+
+			Iterator backtrack = it;
+			size_t cnt = 0;
+
+			if (p(it, end, result)) {
+				it = backtrack;
+				return false;
+			}
+
+			return true;
+		}
+	};
 
 
 	template<typename Parser>
@@ -614,10 +659,10 @@ namespace constfuse {
 			tmp_return_type tempres;
 			bool has_any_parsed = std::apply(
 				helpers::any_parser_applicator<Iterator, tmp_return_type, return_type, Parsers...>, parsers)
-				(it, end, backtrack, tempres, final_result);
+				(it, end, it, tempres, final_result);
 
 			if (has_any_parsed) {
-				*result = std::move(final_result);
+				*result = final_result;
 				return true;
 			}
 			else {
@@ -794,11 +839,21 @@ namespace constfuse {
 	};
 
 	template<typename F, typename P,
-		typename = typename std::enable_if_t<traits::is_parser_v<P> && std::is_invocable_v<F, P, std::string::iterator>>
+		typename = typename std::enable_if_t<traits::is_parser_v<P>>,
+		typename = typename std::is_same<bool, std::invoke_result_t < F, typename P::return_type >>
 	>
-		constexpr auto operator |(P const& p, F f) {
+		constexpr auto operator ^(P const& p, F const& f) {
 		return Precond(f, p);
 	};
+
+	template<typename F, typename P,
+		typename = typename std::enable_if_t<traits::is_parser_v<P>>,
+		typename = typename std::is_same<bool, std::invoke_result_t < F, bool, typename P::return_type* >>
+	>
+		constexpr auto operator |(P const& p, F const& f) {
+		return Postcond(f, p);
+	};
+	
 
 	template<typename P1, typename P2,
 		typename = typename traits::are_parsers_handles_concept<P1, P2>>
@@ -807,30 +862,62 @@ namespace constfuse {
 		return p1(p2);
 	};
 
-	template<typename Iterator>
+	
+	template<typename Iterator, std::size_t threshold = 16>
 	struct ContextAwareIterator {
-		using iterator_category = typename std::iterator_traits<Iterator>::iterator_category;
+
+		//using iterator_category = typename std::iterator_traits<Iterator>::iterator_category;
+		using iterator_category = std::forward_iterator_tag;
 		using value_type = typename std::iterator_traits<Iterator>::value_type;
 		using difference_type = typename std::iterator_traits<Iterator>::difference_type;
 		using pointer = typename std::iterator_traits<Iterator>::pointer;
 		using reference = typename std::iterator_traits<Iterator>::reference;
 
-		ContextAwareIterator(Iterator const& it) :wrapped_iterator(it) {};
+		struct multi_pass {
+			using buffer_type = std::vector<value_type>;
 
-		ContextAwareIterator& operator =(Iterator const& it) {
-			wrapped_iterator = it;
-			return *this;
+			buffer_type value_queue;
+			multi_pass() {
+				value_queue.reserve(threshold);
+			}
+		};
+
+		std::shared_ptr<multi_pass> multi_pass_queue;
+
+		std::size_t queue_position = 0;
+
+		ContextAwareIterator(Iterator const& it) :
+			wrapped_iterator(it),
+			multi_pass_queue(std::make_shared<multi_pass>()){
+		};
+		
+		
+		ContextAwareIterator operator ++(int) {
+			ContextAwareIterator<Iterator, threshold> temp(*this);
+			++*this;
+			return temp;
 		}
 
 		ContextAwareIterator& operator ++() {
-			++wrapped_iterator;
 			updateState(*wrapped_iterator);
-			return *this;
-		}
+			
+			std::size_t size = multi_pass_queue.get()->value_queue.size();
+			if (queue_position == size)
+			{
+				if (size >= threshold && multi_pass_queue.use_count() == 1){
+					multi_pass_queue.get()->value_queue.clear();
+					queue_position = 0;
+				}else{
+					multi_pass_queue.get()->value_queue.push_back(*(wrapped_iterator));
+					++queue_position;
+				}
+				++wrapped_iterator;
+			}
+			else
+			{
+				++queue_position;
+			}
 
-		ContextAwareIterator& operator ++(int) {
-			updateState(*wrapped_iterator);
-			wrapped_iterator++;
 
 			return *this;
 		}
@@ -843,8 +930,19 @@ namespace constfuse {
 			return wrapped_iterator != rhs.wrapped_iterator;
 		}
 
-		reference operator*() const {
-			return *wrapped_iterator;
+		reference operator*() {
+			std::size_t size = multi_pass_queue.get()->value_queue.size();
+			if (queue_position == size)
+			{
+				if (size >= threshold && multi_pass_queue.use_count() == 1)
+				{
+					multi_pass_queue.get()->value_queue.clear();
+					queue_position = 0;
+				}
+				return *wrapped_iterator;
+				
+			}
+			return multi_pass_queue.get()->value_queue[queue_position];
 		}
 
 		auto getCurrentLine() const {
@@ -855,22 +953,23 @@ namespace constfuse {
 			return col;
 		}
 
-		void updateState(reference const& val) {
-			if (val == '\n') {
+		void updateState(reference const val) {
+			if (val == '\n' || val == '\r') {
 				line++;
-				col = 1;
+				col = 0;
 			}
 			else {
 				col++;
 			}
 
 		}
+		
+		
 
 	private:
 		Iterator wrapped_iterator;
 		uint16_t line{ 0 };
 		uint16_t col{ 0 };
-
 	};
 
 }

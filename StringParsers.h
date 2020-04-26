@@ -26,6 +26,28 @@ namespace constfuse::string {
 
 	};
 
+	template<char ...c>
+	struct ParseChars {
+		using is_parser_type = std::true_type;
+		using return_type = char;
+
+		constexpr ParseChars(){};
+
+		template<typename Iterator>
+		bool operator()(Iterator& it, Iterator end, return_type* r) const {
+			if (it == end) return false;
+			if (*it == c ... ||) {
+				if (it != end) it++;
+				if (r != nullptr) {
+					*r = ltr;
+				}
+				return true;
+			}
+
+			return false;
+		};
+
+	};
 
 
 	struct ParseNumber {
@@ -129,6 +151,7 @@ namespace constfuse::string {
 		template<typename Iterator>
 		bool operator()(Iterator& it, Iterator end, return_type* result) const {
 			if (it == end) return false;
+			
 			std::size_t cnt = 0;
 			while (it != end && *it == *(p_ + cnt))
 			{
@@ -160,7 +183,7 @@ namespace constfuse::string {
 	but that just looks ugly and eats heap*/
 	template<char ...c>
 	constexpr auto symbs() {
-		return (ParseChar(c) || ...);
+		return ParseChars<c...>();
 	}
 
 
