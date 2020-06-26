@@ -70,6 +70,9 @@ namespace constfuse {
 
 		template<typename A = void>
 		static constexpr bool is_parser_v = has_parser_trait<A>::value;
+		
+		template<typename ...A>
+		static constexpr bool are_parser_v = (has_parser_trait<A>::value && ... );
 
 
 		template<typename A>
@@ -96,6 +99,10 @@ namespace constfuse {
 
 		template<typename P>
 		using is_parser_t = typename std::enable_if_t<is_parser_v<P>>;
+
+		template<typename ...P>
+		using are_parsers = std::enable_if_t<are_parser_v<P>, int>;
+
 
 		template<typename A, typename B>
 		using are_parsers_concept = std::enable_if_t<is_parser_v<A> && is_parser_v<B>, int>;
@@ -179,15 +186,23 @@ namespace constfuse {
 
 			return [&](Iterator& it, Iterator end, Iterator backtrack, PResults& result, FResult& fres) -> bool {
 				auto aplicator = [&](auto& ...result_item) -> bool {
+					//Pack and pluck after ?
+					Iterator max = backtrack;
 					bool parse_successful = false;
-
 					bool any_parse = (
-						(it = backtrack,
-							parse_successful = p(it, end, &result_item),
+						(backtrack = it,
+							parse_successful = p(backtrack, end, &result_item),
+							max = backtrack < max ? max : backtrack,
 							fres = result_item,
 							parse_successful)
 						|| ...);
-					if (!any_parse) it = backtrack;
+					if (any_parse) {
+						it = backtrack; //maybe
+					}
+					else {
+						it = max; //Max failiure point
+					}
+
 					return any_parse;
 
 				};
@@ -197,6 +212,27 @@ namespace constfuse {
 
 	}
 
+	template<typename Parser>
+	struct Try {
+		using is_parser_type = std::true_type;
+		using return_type = typename Parser::return_type;
+
+		Parser p;
+		constexpr Try(Parser const& p_) :p(p_) {};
+
+		template<typename Iterator>
+		bool operator()(Iterator& it, Iterator end, return_type* result) const {
+
+			Iterator backtrack = it;
+
+			if (p(it, end, result)) {
+				return true;
+			}
+
+			it = backtrack;
+			return false;
+		}
+	};
 
 	namespace monadic {
 
@@ -251,6 +287,36 @@ namespace constfuse {
 			}
 		};
 
+		template<typename Parser>
+		struct RepeatN {
+			using is_parser_type = std::true_type;
+			using return_type = typename Parser::return_type;
+
+			const Parser p;
+			const std::size_t count;
+
+			constexpr RepeatN(Parser const& p_,std::size_t n) :p(p_),count(n) {};
+
+			template<typename Iterator>
+			bool operator()(Iterator& it, Iterator end, return_type* result) const {
+
+				Iterator backtrack = it;
+				size_t cnt = 0;
+
+				while (p(it, end, result)) {
+					backtrack = it;
+					++cnt;
+					if (cnt == count) {
+						return true;
+					}
+				}
+				
+
+				it = backtrack; //Should this be here
+				return false;
+			}
+		};
+
 
 		template<typename LeftParser, typename RightParser>
 		struct Combine {
@@ -281,10 +347,11 @@ namespace constfuse {
 
 			template<typename Iterator>
 			bool operator()(Iterator& it, Iterator end, return_type* result) const {
-				return lparser(it, end, result) || rparser(it, end, result);
+				return Try(lparser)(it, end, result) || Try(rparser)(it, end, result);
 			};
 		};
 
+		
 	}
 
 	template<typename Iterator, typename ReturnType>
@@ -336,7 +403,31 @@ namespace constfuse {
 
 	};
 
+	
+	struct Success {
+		using is_parser_type = std::true_type;
+		using return_type = bool;
 
+		constexpr Success(){};
+
+		template<typename Iterator>
+		bool operator()(Iterator& it, Iterator end, return_type* result) const {
+			
+			return true;
+		}
+	};
+	struct Fail {
+		using is_parser_type = std::true_type;
+		using return_type = bool;
+
+		constexpr Fail() {};
+
+		template<typename Iterator>
+		bool operator()(Iterator& it, Iterator end, return_type* result) const {
+
+			return false;
+		}
+	};
 	
 
 	template<typename LeftParser, typename RightParser>
@@ -395,7 +486,7 @@ namespace constfuse {
 			parser_return_type p_result;
 			auto res = p(it, end, &p_result);
 			if (res) {
-				*result = functor(p_result);
+				*result = functor(std::forward<parser_return_type>(p_result));
 				return true;
 			}
 			return false;
@@ -428,7 +519,8 @@ namespace constfuse {
 	struct Postcond {
 		
 		using is_parser_type = std::true_type;
-		using return_type = typename Parser::return_type;
+		using parser_return_type = typename Parser::return_type;
+		using return_type = typename std::invoke_result_t < F, std::add_lvalue_reference_t<bool>, std::add_lvalue_reference_t<parser_return_type>>;
 
 		
 
@@ -440,11 +532,11 @@ namespace constfuse {
 		template<typename Iterator>
 		bool operator()(Iterator& it, Iterator end, return_type* result) const {
 			Iterator backtrack = it;
-
-			bool res = p(it, end, result);
-			bool fres = functor(res, result);
-			if (!fres) { it = backtrack; } // Is this usefull
-			return fres;
+			parser_return_type temp;
+			bool res = p(it, end, &temp);
+			*result = functor(res, temp); //can modify the result
+			if (!res) { it = backtrack; } // Is this usefull
+			return res;
 		}
 	};
 
@@ -471,9 +563,6 @@ namespace constfuse {
 			if (res) {
 				*result = tmp;
 			}
-			else {
-				it = backtrack;
-			}
 			return res;
 		}
 	};
@@ -495,10 +584,10 @@ namespace constfuse {
 			size_t cnt = 0;
 
 			if (p(it, end, result)) {
-				it = backtrack;
+				it = backtrack; //Q
 				return false;
 			}
-
+			it = backtrack; // Q
 			return true;
 		}
 	};
@@ -530,6 +619,37 @@ namespace constfuse {
 			if (cnt == 0) return false;
 
 			return true;
+		}
+	};
+
+	template<typename Parser>
+	struct RepeatN {
+		using is_parser_type = std::true_type;
+		using return_type = typename std::vector<typename Parser::return_type>;
+		using temp_result_type = typename Parser::return_type;
+
+		const Parser p;
+		const std::size_t count;
+
+		constexpr RepeatN(Parser const& p_, std::size_t n) :p(p_), count(n) {};
+
+		template<typename Iterator>
+		bool operator()(Iterator& it, Iterator end, return_type* result) const {
+			Iterator backtrack = it;
+			size_t cnt = 0;
+
+			temp_result_type tmpres;
+
+			while (p(it, end, &tmpres)) {
+				result->push_back(tmpres);
+				backtrack = it;
+				++cnt;
+				if (cnt == count) return true;
+			}
+			
+
+			it = backtrack;
+			return false;
 		}
 	};
 
@@ -604,7 +724,7 @@ namespace constfuse {
 	};
 
 
-
+	
 
 	template<typename ...Parsers>
 	struct Any {
@@ -649,24 +769,28 @@ namespace constfuse {
 		*/
 
 		parsers_container parsers;
-
+		
 		constexpr Any(Parsers const& ...p) :parsers(p...) {};
 
 		template<typename Iterator>
 		bool operator()(Iterator& it, Iterator end, return_type* result) const {
 			Iterator backtrack = it;
 			return_type final_result;
-			tmp_return_type tempres;
+			
+			auto tempres = new tmp_return_type;
+			
 			bool has_any_parsed = std::apply(
 				helpers::any_parser_applicator<Iterator, tmp_return_type, return_type, Parsers...>, parsers)
-				(it, end, it, tempres, final_result);
-
+				(it, end, it, *tempres, final_result);
+			
+			delete tempres;
+			
 			if (has_any_parsed) {
 				*result = final_result;
 				return true;
 			}
 			else {
-				it = backtrack;
+				//it = backtrack;
 				return false;
 			}
 		};
@@ -693,7 +817,7 @@ namespace constfuse {
 			auto res = p(it, end, &temp);
 			if (res) {
 				res = Many(sep << p)(it, end, result);
-				if (res) result->insert(result->begin(), temp);
+				if (res) result->insert(result->begin(), std::forward<inner_parser_type>(temp));
 
 			}
 			return res;
@@ -718,6 +842,14 @@ namespace constfuse {
 
 			return Seq(p, Many(Seq(sep, p)))(it, end, result);
 		}
+	};
+
+	template<typename Sep,typename ...Parsers,
+		typename = typename traits::are_parsers<Sep,Parsers...>
+	>
+	constexpr auto zip(Sep s ,Parsers& ...p) {
+		//Cant really make the last not match
+		return Seq(p >> s ...);
 	};
 
 
@@ -834,7 +966,7 @@ namespace constfuse {
 	template<typename F, typename P,
 		typename = typename std::enable_if_t<traits::is_parser_v<P> && std::is_invocable_v<F, typename P::return_type>>
 	>
-		constexpr auto operator %(P const& p, F f) {
+		constexpr auto operator %(P const& p, F const& f) {
 		return Map(f, p);
 	};
 
@@ -848,13 +980,13 @@ namespace constfuse {
 
 	template<typename F, typename P,
 		typename = typename std::enable_if_t<traits::is_parser_v<P>>,
-		typename = typename std::is_same<bool, std::invoke_result_t < F, bool, typename P::return_type* >>
+		typename = typename std::invoke_result_t < F, std::add_lvalue_reference_t<bool>, std::add_lvalue_reference_t<typename P::return_type>>
 	>
 		constexpr auto operator |(P const& p, F const& f) {
 		return Postcond(f, p);
 	};
 	
-
+	//Should a lambda returning a parser be accepted here as a parameter?
 	template<typename P1, typename P2,
 		typename = typename traits::are_parsers_handles_concept<P1, P2>>
 		constexpr auto operator >>=(P1 const& p1, P2 const& p2) {
@@ -862,8 +994,14 @@ namespace constfuse {
 		return p1(p2);
 	};
 
+
 	
-	template<typename Iterator, std::size_t threshold = 16>
+
+	struct EmptyContext {
+		using label_type = void;
+	};
+	
+	template<typename Iterator, std::size_t threshold = 16,typename Context = EmptyContext>
 	struct ContextAwareIterator {
 
 		//using iterator_category = typename std::iterator_traits<Iterator>::iterator_category;
@@ -873,42 +1011,45 @@ namespace constfuse {
 		using pointer = typename std::iterator_traits<Iterator>::pointer;
 		using reference = typename std::iterator_traits<Iterator>::reference;
 
-		struct multi_pass {
+		struct multi_pass_shared_state {
 			using buffer_type = std::vector<value_type>;
 
 			buffer_type value_queue;
-			multi_pass() {
+			Context ctx;
+			multi_pass_shared_state() {
 				value_queue.reserve(threshold);
 			}
 		};
 
-		std::shared_ptr<multi_pass> multi_pass_queue;
+		std::shared_ptr<multi_pass_shared_state> multi_pass_state;
 
 		std::size_t queue_position = 0;
 
+		ContextAwareIterator& operator=(ContextAwareIterator const& rhs) = default;
 		ContextAwareIterator(Iterator const& it) :
 			wrapped_iterator(it),
-			multi_pass_queue(std::make_shared<multi_pass>()){
+			multi_pass_state(std::make_shared<multi_pass_shared_state>())
+		{
 		};
 		
 		
 		ContextAwareIterator operator ++(int) {
-			ContextAwareIterator<Iterator, threshold> temp(*this);
+			ContextAwareIterator<Iterator, threshold,Context> temp(*this);
 			++*this;
 			return temp;
 		}
 
 		ContextAwareIterator& operator ++() {
-			updateState(*wrapped_iterator);
+			updateState(this->operator*());
 			
-			std::size_t size = multi_pass_queue.get()->value_queue.size();
+			std::size_t size = multi_pass_state.get()->value_queue.size();
 			if (queue_position == size)
 			{
-				if (size >= threshold && multi_pass_queue.use_count() == 1){
-					multi_pass_queue.get()->value_queue.clear();
+				if (size >= threshold && multi_pass_state.use_count() == 1){
+					multi_pass_state.get()->value_queue.clear();
 					queue_position = 0;
 				}else{
-					multi_pass_queue.get()->value_queue.push_back(*(wrapped_iterator));
+					multi_pass_state.get()->value_queue.push_back(*(wrapped_iterator));
 					++queue_position;
 				}
 				++wrapped_iterator;
@@ -931,35 +1072,40 @@ namespace constfuse {
 		}
 
 		reference operator*() {
-			std::size_t size = multi_pass_queue.get()->value_queue.size();
+			std::size_t size = multi_pass_state.get()->value_queue.size();
 			if (queue_position == size)
 			{
-				if (size >= threshold && multi_pass_queue.use_count() == 1)
+				if (size >= threshold && multi_pass_state.use_count() == 1)
 				{
-					multi_pass_queue.get()->value_queue.clear();
+					multi_pass_state.get()->value_queue.clear();
 					queue_position = 0;
 				}
 				return *wrapped_iterator;
 				
 			}
-			return multi_pass_queue.get()->value_queue[queue_position];
+			return multi_pass_state.get()->value_queue[queue_position];
 		}
 
-		auto getCurrentLine() const {
-			return line;
+		bool operator <(ContextAwareIterator const& rhs) const{
+			return (line() * column()) < (rhs.line() * rhs.column());
 		}
 
-		auto getCurrentCol() const {
-			return col;
+		Context& getContext() { return multi_pass_state.get()->ctx; }
+		auto line() const {
+			return line_;
+		}
+
+		auto column() const {
+			return col_;
 		}
 
 		void updateState(reference const val) {
 			if (val == '\n' || val == '\r') {
-				line++;
-				col = 0;
+				++line_;
+				col_ = 0;
 			}
 			else {
-				col++;
+				++col_;
 			}
 
 		}
@@ -968,8 +1114,127 @@ namespace constfuse {
 
 	private:
 		Iterator wrapped_iterator;
-		uint16_t line{ 0 };
-		uint16_t col{ 0 };
+		uint16_t line_{1};
+		uint16_t col_{0};
+	};
+
+
+	template<typename T>
+	struct GenericContext {
+
+		using label_type = T;
+
+		struct Element {
+			T tag;
+			std::size_t depth{1};
+			bool exited{false};
+		};
+
+		void enter(T contextTag) {
+			++depth;
+			context_ring.push_back({contextTag,depth});
+		};
+		void exit(T contextTag) {
+			--depth;
+			//Should be able to mark the past node to exited
+		};
+
+		bool hasSibling(T contextTag) {
+			for (Element& elem : context_ring) {
+				if (elem.depth < depth) break;
+				if (elem.depth == depth && elem.tag == contextTag) return true;
+			}
+			return false;
+		};
+
+		bool hasParent(T contextTag) {
+			auto result = std::find_if(std::begin(context_ring), std::end(context_ring), [&depth](auto t) {
+				return t.depth == (depth - 1);
+			});
+
+			return result != std::begin(context_ring);
+		};
+		//Parrents
+
+		std::size_t currentDepth() { return depth; }
+
+	private:
+		std::size_t depth{1};
+		std::vector<Element> context_ring;
+	};
+	
+	
+	template<typename P,std::size_t N>
+	struct Labeled {
+		using is_parser_type = std::true_type;
+		using return_type = typename P::return_type;
+
+		const char* const name;
+		P  const p;
+		const std::size_t size;
+
+		constexpr Labeled(const char(&name_)[N], P const& p_) :name(name_), p(p_), size(N - 1) {};
+
+		template<typename Iterator>
+		bool operator()(Iterator& it, Iterator end, return_type* result) const {
+			static_assert(std::is_convertible_v<const char*, std::remove_reference_t<decltype(it.getContext())>::label_type>,"Invalid Label type in context container");
+			it.getContext().enter(name);
+			bool res = p(it, end, result);
+			it.getContext().exit(name);
+			return res;
+		}
+	};
+
+	template<typename To, std::size_t ...I>
+	struct Converter {
+		constexpr Converter() {};
+
+		template<typename T, class Tuple, std::size_t ...I>
+		static constexpr T tuple_forwarder(Tuple&& t, std::index_sequence<I...>) {
+			return T{ std::get<I>(std::forward<Tuple>(t)) ... };
+		}
+
+		template<typename T, typename Tuple>
+		static constexpr T tuple_to_object(Tuple&& t) {
+			return tuple_forwarder<T>(std::forward<Tuple>(t), std::make_index_sequence<std::tuple_size_v<std::remove_reference_t<Tuple>>>{});
+		}
+
+		template<typename T, typename Tuple, std::size_t ...I,
+			typename = std::enable_if_t<std::tuple_size_v<std::remove_reference_t<Tuple>> == sizeof...(I)> >
+			static constexpr T tuple_to_object(Tuple&& t) {
+			return tuple_forwarder<T>(std::forward<Tuple>(t), std::integer_sequence<std::size_t, I...>{});
+		}
+
+		template<typename From>
+		To operator()(From&& obj) const {
+			return To{ std::forward<From>(obj) };
+		}
+
+		template<typename ...From>
+		To operator()(std::tuple<From...>&& obj) const {
+			return tuple_to_object<To, std::add_lvalue_reference_t<std::tuple<From...>>, I...>(obj);
+		}
+	};
+
+	template<>
+	struct Converter<int> {
+		int operator()(std::string s) const{
+			return std::stoi(s);
+		}
+		
+	};
+
+	template<typename Value>
+	struct to_value {
+
+		Value const v;
+
+		constexpr to_value(Value const& v_) :v(v_) {};
+
+		template<typename T>
+		const auto operator()(bool&, T&) const {
+			return v;
+		}
 	};
 
 }
